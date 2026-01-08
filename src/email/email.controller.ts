@@ -4,6 +4,7 @@ import {
   UploadedFile,
   UseInterceptors,
   Query,
+  Param,
   BadRequestException,
   Get,
   Res,
@@ -14,7 +15,7 @@ import type { Response } from 'express';
 
 @Controller('emails')
 export class EmailController {
-  constructor(private readonly emailService: EmailService) {}
+  constructor(private readonly emailService: EmailService) { }
 
   /**
    * Upload CSV & process emails
@@ -30,13 +31,26 @@ export class EmailController {
 
     return {
       status: 'success',
-      totalEmails: result.total,
-      deliverableCount: result.deliverableCount,
-      undeliverableCount: result.undeliverableCount,
-      deliverableEmails: result.deliverableEmails,
-      nonDeliverableEmails: result.nonDeliverableEmails,
-      details: result.details,
+      ...result
     };
+  }
+
+  /**
+   * Get upload history
+   */
+  @Get('history')
+  async getHistory() {
+    return this.emailService.getHistory();
+  }
+
+  /**
+   * Get specific history details
+   */
+  @Get('history/:id')
+  async getHistoryDetails(@Param('id') id: string) {
+    const details = await this.emailService.getHistoryById(id);
+    if (!details) throw new BadRequestException('History not found');
+    return details;
   }
 
   /**

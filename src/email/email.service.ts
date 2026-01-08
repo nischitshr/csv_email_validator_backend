@@ -1,37 +1,41 @@
 import { Injectable } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
 import { Readable } from 'stream';
 import * as csv from 'fast-csv';
 import * as validator from 'validator';
 import { promises as dns } from 'dns';
 import { createObjectCsvStringifier } from 'csv-writer';
+import { UploadHistory as UploadHistoryEntity } from './entities/upload-history.entity';
+import { ValidationDetail as ValidationDetailEntity } from './entities/validation-detail.entity';
+
+export { UploadHistoryEntity as UploadHistory, ValidationDetailEntity as ValidationDetail };
 
 /** Disposable and role-based email lists */
-const DISPOSABLE_DOMAINS = ['10minutemail.com', 'mailinator.com', 'tempmail.com'];
-const ROLE_PREFIXES = ['info', 'admin', 'support', 'contact', 'sales'];
+const DISPOSABLE_DOMAINS = [
+  '10minutemail.com', 'mailinator.com', 'tempmail.com', 'throwawaymail.com',
+  'guerrillamail.com', 'sharklasers.com', 'dispostable.com', 'getnada.com',
+  'temp-mail.org', 'yopmail.com', 'trashmail.com'
+];
+const ROLE_PREFIXES = ['info', 'admin', 'support', 'contact', 'sales', 'billing', 'help', 'jobs'];
 
 @Injectable()
 export class EmailService {
-  private storedResults: any = null; // In-memory storage
+  constructor(
+    @InjectRepository(UploadHistoryEntity)
+    private historyRepo: Repository<UploadHistoryEntity>,
+    @InjectRepository(ValidationDetailEntity)
+    private detailRepo: Repository<ValidationDetailEntity>,
+  ) { }
 
   /**
    * Process uploaded CSV file and validate emails
    */
   async processCSV(file: Express.Multer.File) {
-    const deliverable: string[] = [];
-    const nonDeliverable: string[] = [];
-    const details: {
-      email: string;
-      syntaxValid: boolean;
-      domainValid: boolean;
-      mxValid: boolean;
-      disposable: boolean;
-      roleBased: boolean;
-      deliverable: boolean;
-      confidence: number;
-      reason: string;
-    }[] = [];
+    const detailsData: Partial<ValidationDetailEntity>[] = [];
+    let deliverableCount = 0;
+    let undeliverableCount = 0;
 
-    /** Read CSV */
     const rows: any[] = [];
     const stream = Readable.from(file.buffer.toString());
 
@@ -43,92 +47,123 @@ export class EmailService {
         .on('end', resolve);
     });
 
-    /** Process emails */
-    for (const row of rows) {
-      const email: string = row.email?.trim();
-      if (!email) continue;
-
-      const syntaxValid = validator.isEmail(email);
-      const domain = email.split('@')[1]?.toLowerCase() || '';
-      const local = email.split('@')[0]?.toLowerCase() || '';
-
-      let domainValid = false;
-      let mxValid = false;
-
-      if (syntaxValid) {
-        try {
-          await dns.lookup(domain);
-          domainValid = true;
-        } catch {}
-
-        try {
-          const mxRecords = await dns.resolveMx(domain);
-          mxValid = mxRecords.length > 0;
-        } catch {}
-      }
-
-      const disposable = DISPOSABLE_DOMAINS.includes(domain);
-      const roleBased = ROLE_PREFIXES.some((p) => local.startsWith(p));
-
-      const isDeliverable =
-        syntaxValid && domainValid && mxValid && !disposable && !roleBased;
-
-      /** Confidence + reason */
-      let confidence = isDeliverable ? 100 : 0;
-      let reason = 'Valid';
-
-      if (!syntaxValid) reason = 'Invalid syntax';
-      else if (!domainValid) reason = 'Invalid domain';
-      else if (!mxValid) reason = 'No MX record';
-      else if (disposable) reason = 'Disposable email';
-      else if (roleBased) reason = 'Role-based email';
-
-      if (isDeliverable) deliverable.push(email);
-      else nonDeliverable.push(email);
-
-      details.push({
-        email,
-        syntaxValid,
-        domainValid,
-        mxValid,
-        disposable,
-        roleBased,
-        deliverable: isDeliverable,
-        confidence,
-        reason,
-      });
+    if (rows.length === 0) {
+      throw new Error('CSV file is empty');
     }
 
-    /** Store results for pagination & export */
-    this.storedResults = {
-      total: deliverable.length + nonDeliverable.length,
-      deliverableCount: deliverable.length,
-      undeliverableCount: nonDeliverable.length,
-      deliverableEmails: deliverable,
-      nonDeliverableEmails: nonDeliverable,
-      details,
-    };
+    // Try to find the email column if "email" header is missing
+    const firstRow = rows[0];
+    let emailKey = 'email';
+    if (!(emailKey in firstRow)) {
+      const possibleKeys = Object.keys(firstRow);
+      const foundKey = possibleKeys.find(k => k.toLowerCase().includes('email'));
+      if (foundKey) emailKey = foundKey;
+    }
 
-    return this.storedResults;
+    // Limit concurrency for DNS lookups to avoid rate limiting
+    const batchSize = 10;
+    for (let i = 0; i < rows.length; i += batchSize) {
+      const batch = rows.slice(i, i + batchSize);
+      await Promise.all(batch.map(async (row) => {
+        const email: string = row[emailKey]?.trim();
+        if (!email) return;
+
+        const syntaxValid = validator.isEmail(email);
+        const [local, domain] = email.split('@').map(s => s?.toLowerCase() || '');
+
+        let domainValid = false;
+        let mxValid = false;
+
+        if (syntaxValid && domain) {
+          try {
+            // DNS lookup for A record
+            await dns.lookup(domain);
+            domainValid = true;
+          } catch { }
+
+          try {
+            // DNS resolve for MX records
+            const mxRecords = await dns.resolveMx(domain);
+            mxValid = mxRecords.length > 0;
+          } catch { }
+        }
+
+        const disposable = DISPOSABLE_DOMAINS.includes(domain);
+        const roleBased = ROLE_PREFIXES.some((p) => local.startsWith(p));
+
+        const isDeliverable = syntaxValid && domainValid && mxValid && !disposable;
+
+        if (isDeliverable) deliverableCount++;
+        else undeliverableCount++;
+
+        let reason = 'Valid';
+        if (!syntaxValid) reason = 'Invalid syntax';
+        else if (!domainValid) reason = 'Invalid domain';
+        else if (!mxValid) reason = 'No MX record';
+        else if (disposable) reason = 'Disposable email';
+        else if (roleBased) reason = 'Role-based (Warning)';
+
+        detailsData.push({
+          email,
+          syntaxValid,
+          domainValid,
+          mxValid,
+          disposable,
+          roleBased,
+          deliverable: isDeliverable,
+          confidence: isDeliverable ? (roleBased ? 80 : 100) : 0,
+          reason,
+        });
+      }));
+    }
+
+    const history = this.historyRepo.create({
+      filename: file.originalname,
+      total: detailsData.length,
+      deliverableCount,
+      undeliverableCount,
+      details: detailsData.map(d => this.detailRepo.create(d)),
+    });
+
+    return await this.historyRepo.save(history);
   }
 
-  /**
-   * Get all processed emails
-   */
+  async getHistory() {
+    return await this.historyRepo.find({
+      order: { processedAt: 'DESC' },
+      take: 20,
+    });
+  }
+
+  async getHistoryById(id: string) {
+    return await this.historyRepo.findOne({
+      where: { id },
+      relations: ['details'],
+    });
+  }
+
   async getAllEmails() {
-    if (!this.storedResults) return [];
-    return this.storedResults.details;
+    // This was used for the list endpoint, we'll fetch the last one
+    const lastHistory = await this.historyRepo.findOne({
+      where: {},
+      order: { processedAt: 'DESC' },
+      relations: ['details'],
+    });
+    return lastHistory?.details || [];
   }
 
-  /**
-   * Export results as CSV
-   */
   async exportCSV(type: 'deliverable' | 'undeliverable' | 'all') {
-    if (!this.storedResults) {
+    const lastHistory = await this.historyRepo.findOne({
+      where: {},
+      order: { processedAt: 'DESC' },
+      relations: ['details'],
+    });
+
+    if (!lastHistory) {
       throw new Error('No data available to export');
     }
 
-    let records = this.storedResults.details;
+    let records = lastHistory.details;
 
     if (type === 'deliverable') {
       records = records.filter((e) => e.deliverable);
